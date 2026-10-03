@@ -123,7 +123,12 @@ def fetch_forecast(latitude: float, longitude: float) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_inpost_actual() -> tuple[dict[str, Any] | None, str | None]:
+def fetch_inpost_actual() -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "checked_at": now_warsaw().isoformat(timespec="seconds"),
+        "method": "POST",
+        "endpoint": INPOST_URL,
+    }
     headers = {
         "X-Requested-With": "XMLHttpRequest",
         "Referer": INPOST_REFERER,
@@ -132,10 +137,20 @@ def fetch_inpost_actual() -> tuple[dict[str, Any] | None, str | None]:
     }
     try:
         r = requests.post(INPOST_URL, headers=headers, timeout=12)
+        diagnostics.update({
+            "http_status": r.status_code,
+            "response_url": r.url,
+            "content_type": r.headers.get("Content-Type", ""),
+            "elapsed_seconds": round(r.elapsed.total_seconds(), 3),
+            "redirects": [response.status_code for response in r.history],
+            "response_preview": r.text[:1500],
+        })
         r.raise_for_status()
         payload = r.json()
         if not isinstance(payload, dict):
             raise ValueError("InPost zwrócił nieprawidłowy format danych.")
+        diagnostics["json_keys"] = list(payload.keys())
+        diagnostics["air_sensors_type"] = type(payload.get("air_sensors")).__name__
         sensors: dict[str, float] = {}
         for item in payload.get("air_sensors") or []:
             if not isinstance(item, str):
@@ -150,6 +165,7 @@ def fetch_inpost_actual() -> tuple[dict[str, Any] | None, str | None]:
                     pass
         if not sensors:
             raise ValueError("InPost nie zwrócił odczytów czujników.")
+        diagnostics["parsed_sensors"] = sensors
         return {
             "temperature": sensors.get("TEMPERATURE"),
             "humidity": sensors.get("HUMIDITY"),
@@ -160,9 +176,11 @@ def fetch_inpost_actual() -> tuple[dict[str, Any] | None, str | None]:
             "air_quality": payload.get("air_index_level", "—"),
             "time": now_warsaw(),
             "source": "WAW582M · InPost",
-        }, None
+        }, None, diagnostics
     except (requests.RequestException, ValueError, TypeError) as exc:
-        return None, str(exc)
+        diagnostics["exception_type"] = type(exc).__name__
+        diagnostics["exception"] = str(exc)
+        return None, f"{type(exc).__name__}: {exc}", diagnostics
 
 
 def nearest_forecast_row(df: pd.DataFrame, when: datetime) -> pd.Series:
@@ -591,7 +609,14 @@ def main() -> None:
         st.error(f"Nie udało się pobrać prognozy Open-Meteo: {exc}")
         return
 
-    actual, actual_error = fetch_inpost_actual()
+    if st.button("Odśwież odczyt InPost", key="refresh_inpost"):
+        fetch_inpost_actual.clear()
+    actual, actual_error, diagnostics = fetch_inpost_actual()
+    if actual_error:
+        st.warning(f"Brak pomiaru InPost. Wyświetlane dane pogodowe są prognozą ECMWF. Błąd: {actual_error}")
+    with st.expander("Diagnostyka InPost", expanded=bool(actual_error)):
+        st.caption("Odpowiedź z serwera uruchamiającego aplikację. Czas oznacza pobranie, nie czas pomiaru czujnika. Wynik jest buforowany przez 5 minut; przycisk powyżej wymusza nową próbę.")
+        st.json(diagnostics)
     current_fc = nearest_forecast_row(forecast, now_warsaw())
     hourly = next_hours(forecast, 24)
     daily = daily_summary(forecast, 7)
